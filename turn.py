@@ -13,7 +13,7 @@ import anyio
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher, ResultMessage, SystemMessage, AssistantMessage
 import yaml
 from opentelemetry import propagate, trace
-from telemetry import turn_span
+from telemetry import model_requests, turn_span
 from task_recovery import Recovery
 from worker_files import persist_terminal, publish
 from agentteams_skill_warnings import check_skill, report_warnings
@@ -126,7 +126,9 @@ async def run_turn(record, provider, workspace, prompt, session, task, bundle, *
     model = provider["models"][0]["id"]
     if (record["desired"].get("agentPackage") or {}).get("ref"):
         raise ValueError("Claude Code does not support AgentSpec packages")
-    with turn_span(role_of(record), task, model) as span, tempfile.TemporaryDirectory(prefix="at-claude-skills-") as directory:
+    with (turn_span(role_of(record), task, model) as span,
+          model_requests(span, workspace, session) as new_session_id,
+          tempfile.TemporaryDirectory(prefix="at-claude-skills-") as directory):
         plugin = Path(directory)
         instructions = prepare_assets(record, bundle, plugin)
         servers = mcp_servers(record, bundle, provider, task)
@@ -201,7 +203,7 @@ async def run_turn(record, provider, workspace, prompt, session, task, bundle, *
         allowed_mcp = ["mcp__teamharness__task"] if decision or task.get("execution") else [
             "mcp__" + name + "__*" for name in servers]
         options = ClaudeAgentOptions(
-            model=model, cwd=str(workspace), resume=session, tools=tools,
+            model=model, cwd=str(workspace), resume=session, session_id=new_session_id, tools=tools,
             allowed_tools=tools + allowed_mcp, permission_mode="dontAsk",
             system_prompt={"type": "preset", "preset": "claude_code", "append": instructions, "snapshot": False},
             setting_sources=[], plugins=[{"type": "local", "path": directory}],

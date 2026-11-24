@@ -29,6 +29,12 @@ Core owns the public `task/v1` schema, authorization, state transitions and arti
 
 See the [Core deployment guide](https://github.com/agentscope-ai/AgentTeams/blob/f2d5424f09976b1c2703a1732c64d19c93fcff6b/docs/usage/integrations/claude-code.md), [integration handoff](docs/handoff.md) and [Harness admission guide](https://github.com/agentscope-ai/AgentTeams/blob/main/docs/design/harness-integration-guide.md).
 
+## Model request tracing
+
+With AgentTeams tracing enabled, count model attempts using `claude-code.model.request`. The Harness exports one child span per request recorded by the pinned Claude CLI, including HTTP retries and the fallback from streaming to a non-streaming request. It reads the current turn’s native journal after SDK teardown, including when the Harness times out. A resumed turn skips requests from earlier turns.
+
+`agentteams.model.request.id` identifies each attempt. A terminal assistant reply supplies `gen_ai.response.id`. An attempt without a terminal reply has error status. Its end time is the next observed request or the end of the turn, as identified by `agentteams.model.end_observation`. These times give an observation boundary for diagnosing a stall. The existing `claude-code.model.response` spans describe SDK response messages. Count a successful generation once by its response ID. Request spans contain metadata only.
+
 ## References
 
 - [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview)
