@@ -19,7 +19,7 @@ def scan(client, record, transport, rooms, agents, ready, admitted):
 
     def classify(room, raw):
         event = admitted(raw, room, rooms, member, agents, transport, policy)
-        if event:
+        if event and not event.get("control"):
             packet = (event.get("_task_protocol_meta") or {}).get("teamharness_coordination") or {}
             if packet.get("kind") == "task_assigned":
                 return "task_notification", packet["task_id"]
@@ -36,7 +36,7 @@ def scan(client, record, transport, rooms, agents, ready, admitted):
         if room not in joined or snapshot["state"]["rooms"].get(room, {}).get("gaps"):
             continue
         event = admitted({**row["input"], "event_id": row["event_id"]}, room, rooms, member, agents, transport, policy)
-        if not event:
+        if not event or event.get("control"):
             continue
         if row["intent"] == "task_notification":
             task_id = (row.get("work") or {}).get("task_id")

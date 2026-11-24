@@ -1,5 +1,6 @@
 """Project one AT member turn onto the public Claude Code Agent SDK."""
 import asyncio
+from contextlib import suppress
 import json
 import os
 from pathlib import Path
@@ -7,16 +8,19 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from urllib.parse import urlsplit
 
 import anyio
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, HookMatcher, ResultMessage, SystemMessage, AssistantMessage
+from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny, StreamEvent
 import yaml
 from opentelemetry import propagate, trace
 from telemetry import model_requests, turn_span
 from task_recovery import Recovery
-from worker_files import persist_terminal, publish
+from worker_files import persist_terminal, stage_output
 from agentteams_skill_warnings import check_skill, report_warnings
+from interaction import TurnStopped
 
 
 def role_of(record):
@@ -122,7 +126,7 @@ def file_allowed(tool, fields, workspace, skills, context):
     return any(path.is_relative_to(root) for root in [*input_directories(context), *(s.resolve() for s in skills)])
 
 
-async def run_turn(record, provider, workspace, prompt, session, task, bundle, *, on_effect=None, on_checkpoint=None):
+async def run_turn(record, provider, workspace, prompt, session, task, bundle, *, on_effect=None, on_checkpoint=None, interaction=None):
     model = provider["models"][0]["id"]
     if (record["desired"].get("agentPackage") or {}).get("ref"):
         raise ValueError("Claude Code does not support AgentSpec packages")
@@ -135,10 +139,10 @@ async def run_turn(record, provider, workspace, prompt, session, task, bundle, *
         refreshed = plugin / "refreshed.json"
         servers["teamharness"]["env"]["AT_CLAUDE_REFRESH_FILE"] = str(refreshed)
         decision = any(task.get(key) for key in ("review", "planning", "completion"))
-        tools = [] if decision else ["Read", "Glob", "Grep", "Skill"]
+        tools = ["AskUserQuestion"] if decision else ["Read", "Glob", "Grep", "Skill", "AskUserQuestion"]
         if not decision and role_of(record) != "manager":
             tools.extend(["Write", "Edit"])
-        if not decision and not task.get("execution") and os.getenv("AGENTTEAMS_YOLO") == "1":
+        if not decision and not task.get("execution") and (role_of(record) != "manager" or os.getenv("AGENTTEAMS_YOLO") == "1"):
             tools.append("Bash")
         context = task.get("context") or {}
         identity = task.get("identity")
@@ -154,7 +158,9 @@ async def run_turn(record, provider, workspace, prompt, session, task, bundle, *
             try:
                 if confirmed and on_checkpoint and on_checkpoint(*confirmed):
                     confirmed = None
-                if on_effect and name not in {"Read", "Glob", "Grep", "Skill"}:
+                if interaction and interaction.stopped:
+                    raise ValueError("This execution has stopped")
+                if on_effect and name not in {"Read", "Glob", "Grep", "Skill", "AskUserQuestion"}:
                     on_effect()
                 if name in {"Read", "Write", "Edit", "Glob", "Grep"} and not file_allowed(
                         name, fields, workspace, (plugin / "skills").iterdir(), context):
@@ -167,6 +173,8 @@ async def run_turn(record, provider, workspace, prompt, session, task, bundle, *
                                                                    "read_only": name in {"Read", "Glob", "Grep"}}])
                         operations[key] = operation
             except (OSError, ValueError, subprocess.SubprocessError) as error:
+                if interaction:
+                    await interaction.tool(data.get("tool_use_id") or call_id, name, fields, "failed", str(error))
                 return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                                "permissionDecisionReason": str(error)}}
             key = data.get("tool_use_id") or call_id
@@ -174,37 +182,60 @@ async def run_turn(record, provider, workspace, prompt, session, task, bundle, *
                 tool_spans[key] = trace.get_tracer("agentteams.claude-code").start_span("claude-code.tool",
                     attributes={"gen_ai.tool.name": name, "gen_ai.tool.call.id": key,
                                 "agentteams.session.id": data.get("session_id") or ""})
+                if interaction:
+                    await interaction.tool(key, name, fields, "running")
             return {}
 
         async def after_tool(data, call_id, _context):
             nonlocal confirmed
             key = data.get("tool_use_id") or call_id
+            response = data.get("tool_response")
+            success = data.get("hook_event_name") == "PostToolUse" and not (
+                isinstance(response, dict) and (response.get("isError") is True or response.get("is_error") is True))
             tool_span = tool_spans.pop(key, None)
             if tool_span:
+                if not success:
+                    tool_span.set_status(trace.StatusCode.ERROR)
                 tool_span.end()
             if key in operations:
                 name = data["tool_name"]
-                success = data.get("hook_event_name") == "PostToolUse"
                 if not success and name not in {"Read", "Glob", "Grep"}:
+                    if interaction:
+                        await interaction.tool(key, name, data.get("tool_input") or {}, "failed", data.get("error"))
                     return {}  # Keep the registered mutation unresolved until authoritative verification.
                 artifacts = []
+                files = []
                 if success and name in {"Write", "Edit"}:
-                    artifacts.append(publish(identity, workspace, data["tool_input"]["file_path"], operations[key]))
+                    artifact, staged = stage_output(identity, workspace, data["tool_input"]["file_path"], operations[key])
+                    artifacts.append(artifact)
+                    files.append(staged)
                 result = {"id": key, "content": artifacts or {"response_sha256": Recovery.digest(data.get("tool_response") if success else data.get("error"))}}
                 if not success:
                     result.update(status="error", effect="none")
-                persist_terminal(identity, operations[key], result, artifacts)
+                persist_terminal(identity, operations[key], result, artifacts, files=files)
                 saved = recovery.finish_tools(identity, operations[key], [result], artifacts=artifacts)
                 if data.get("session_id"):
                     confirmed = (data["session_id"], key, saved["execution"])
                 del operations[key]
+            if interaction:
+                await interaction.tool(key, data["tool_name"], data.get("tool_input") or {},
+                    "succeeded" if success else "failed", response if success else data.get("error") or response)
             return {}
 
-        allowed_mcp = ["mcp__teamharness__task"] if decision or task.get("execution") else [
-            "mcp__" + name + "__*" for name in servers]
+        async def permission(name, fields, context):
+            if interaction is None:
+                return PermissionResultDeny(message="Human approval requires the active Matrix interaction")
+            result = await interaction.permission(name, fields, context.tool_use_id)
+            if result is False:
+                return PermissionResultDeny(message="The human rejected the request, or it expired")
+            return PermissionResultAllow(updated_input=result if isinstance(result, dict) else fields)
+
+        allowed_mcp = ["mcp__teamharness__task"] if decision or task.get("execution") else ["mcp__teamharness__*"]
         options = ClaudeAgentOptions(
             model=model, cwd=str(workspace), resume=session, session_id=new_session_id, tools=tools,
-            allowed_tools=tools + allowed_mcp, permission_mode="dontAsk",
+            allowed_tools=[name for name in tools if name != "AskUserQuestion"
+                           and (name != "Bash" or os.getenv("AGENTTEAMS_YOLO") == "1")] + allowed_mcp,
+            permission_mode="default", can_use_tool=permission, include_partial_messages=True,
             system_prompt={"type": "preset", "preset": "claude_code", "append": instructions, "snapshot": False},
             setting_sources=[], plugins=[{"type": "local", "path": directory}],
             mcp_servers=servers, strict_mcp_config=True,
@@ -216,43 +247,109 @@ async def run_turn(record, provider, workspace, prompt, session, task, bundle, *
                  "ANTHROPIC_AUTH_TOKEN": provider["apiKey"], "ANTHROPIC_API_KEY": "",
                  "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"},
         )
-        async with ClaudeSDKClient(options=options) as client:
-            if decision or task.get("execution") or (task.get("sources") and os.getenv("AGENTTEAMS_CONTROLLER_URL")):
-                with anyio.fail_after(30):
-                    while True:
-                        status = await client.get_mcp_status()
-                        server = next((item for item in status["mcpServers"] if item["name"] == "teamharness"), {})
-                        tool = next((t for t in server.get("tools", []) if t["name"] == "task"), None)
-                        if server.get("status") == "connected" and tool:
-                            task_name = f"mcp__{server['name']}__{tool['name']}"
-                            break
-                        if server.get("status") in {"failed", "disabled", "needs-auth"}:
-                            raise RuntimeError("The registered TeamHarness Task tool is unavailable")
-                        await asyncio.sleep(0.1)
-                prompt = f"Use the registered Task tool {task_name} for Task operations.\n" + prompt
-            await client.query(prompt)
-            stream = client.receive_response()
-            while True:
-                # Bound each idle interval, including waiting for the final result.
-                with anyio.fail_after(float(os.getenv("AGENTTEAMS_LLM_STREAM_TIMEOUT_S", "300"))):
-                    try:
-                        message = await anext(stream)
-                    except StopAsyncIteration:
+        try:
+            async with ClaudeSDKClient(options=options) as client:
+                watcher = None
+                if interaction:
+                    await interaction.start()
+                    watcher = asyncio.create_task(interaction.watch(client))
+                try:
+                    return await receive(client, interaction, watcher, span, refreshed, prompt, task)
+                finally:
+                    if watcher:
+                        watcher.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await watcher
+                    if interaction:
+                        await interaction.close("cancelled" if interaction.stopped else "expired")
+        finally:
+            if interaction:
+                await interaction.close("cancelled" if interaction.stopped else "expired", terminal=True)
+                if interaction.stopped:
+                    # Publish stopped only after the SDK process and its tools exit.
+                    await interaction.status("stopped")
+
+
+async def receive(client, interaction, watcher, span, refreshed, prompt, task):
+    try:
+        if any(task.get(key) for key in ("review", "planning", "completion", "execution")) or (task.get("sources") and os.getenv("AGENTTEAMS_CONTROLLER_URL")):
+            with anyio.fail_after(30):
+                while True:
+                    status = await client.get_mcp_status()
+                    server = next((item for item in status["mcpServers"] if item["name"] == "teamharness"), {})
+                    tool = next((t for t in server.get("tools", []) if t["name"] == "task"), None)
+                    if server.get("status") == "connected" and tool:
+                        task_name = f"mcp__{server['name']}__{tool['name']}"
                         break
-                if isinstance(message, SystemMessage) and message.subtype == "init":
-                    span.set_attribute("agentteams.session.id", message.data.get("session_id") or "")
-                    span.set_attribute("agentteams.turn.id", message.data.get("uuid") or "")
-                if isinstance(message, AssistantMessage):
-                    with trace.get_tracer("agentteams.claude-code").start_as_current_span("claude-code.model.response") as result_span:
-                        result_span.set_attribute("gen_ai.response.model", message.model)
-                        result_span.set_attribute("gen_ai.response.id", getattr(message, "message_id", None) or "")
-                if isinstance(message, ResultMessage):
-                    if message.is_error or message.subtype != "success" or not message.result:
-                        reason = message.terminal_reason or message.subtype
-                        if message.api_error_status is not None:
-                            reason = f"gateway HTTP {message.api_error_status}"
-                        raise RuntimeError(f"Claude Code returned no usable result ({reason})")
-                    if refreshed.is_file():
-                        task["refresh"] = json.loads(refreshed.read_text())
-                    return message.session_id, message.result
-    raise RuntimeError("Claude Code exited without a result")
+                    if server.get("status") in {"failed", "disabled", "needs-auth"}:
+                        raise RuntimeError("The registered TeamHarness Task tool is unavailable")
+                    await asyncio.sleep(0.1)
+            prompt = f"Use the registered Task tool {task_name} for Task operations.\n" + prompt
+        await client.query(prompt)
+        stream = client.receive_response()
+        while True:
+            # Bound each idle interval, including waiting for the final result.
+            reader = asyncio.create_task(anext(stream))
+            try:
+                idle = 0
+                while not reader.done():
+                    done, _ = await asyncio.wait([reader, *([watcher] if watcher else [])], timeout=0.5,
+                                                 return_when=asyncio.FIRST_COMPLETED)
+                    if watcher and watcher in done:
+                        await watcher  # Surface failures instead of silently disabling human control.
+                        if interaction.stopped:
+                            raise TurnStopped(interaction.session)
+                    if not (interaction and interaction.pending):
+                        idle += 0.5
+                    if not reader.done() and idle >= float(os.getenv("AGENTTEAMS_LLM_STREAM_TIMEOUT_S", "300")):
+                        await client.interrupt()
+                        raise TimeoutError("Claude response stream timed out")
+                    if interaction and interaction.stopped and interaction.stop_started and time.monotonic() - interaction.stop_started > 5:
+                        raise TurnStopped(interaction.session)
+                try:
+                    message = reader.result()
+                except StopAsyncIteration:
+                    break
+            finally:
+                if not reader.done():
+                    reader.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await reader
+            if isinstance(message, SystemMessage) and message.subtype == "init":
+                span.set_attribute("agentteams.session.id", message.data.get("session_id") or "")
+                span.set_attribute("agentteams.turn.id", message.data.get("uuid") or "")
+                if interaction:
+                    interaction.session = message.data.get("session_id")
+            if isinstance(message, StreamEvent) and interaction:
+                await interaction.stream(message.event)
+            if isinstance(message, AssistantMessage):
+                with trace.get_tracer("agentteams.claude-code").start_as_current_span("claude-code.model.response") as result_span:
+                    result_span.set_attribute("gen_ai.response.model", message.model)
+                    result_span.set_attribute("gen_ai.response.id", getattr(message, "message_id", None) or "")
+            if isinstance(message, ResultMessage):
+                if interaction and interaction.stopped:
+                    raise TurnStopped(message.session_id)
+                if message.is_error or message.subtype != "success" or not message.result:
+                    reason = message.terminal_reason or message.subtype
+                    if message.api_error_status is not None:
+                        reason = f"gateway HTTP {message.api_error_status}"
+                    raise RuntimeError(f"Claude Code returned no usable result ({reason})")
+                if interaction and not interaction.confirm_inputs(message):
+                    # A result for the original input can race with a steer.
+                    # Keep the native session open until its UUID is consumed.
+                    await stream.aclose()
+                    stream = client.receive_response()
+                    continue
+                if refreshed.is_file():
+                    task["refresh"] = json.loads(refreshed.read_text())
+                if interaction:
+                    await interaction.status("completed")
+                return message.session_id, message.result
+        raise RuntimeError("Claude Code exited without a result")
+    except TurnStopped:
+        raise
+    except BaseException:
+        if interaction:
+            await interaction.status("failed")
+            await interaction.block("ending", {"type": "error", "kind": "failed", "title": "Claude execution failed"}, "Claude execution failed")
+        raise

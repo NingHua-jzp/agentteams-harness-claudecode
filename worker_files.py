@@ -5,6 +5,9 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import shutil
+
+from bridge_state import atomic_write
 
 from task_recovery import RecoveryConflict
 
@@ -16,16 +19,6 @@ def digest(path):
 
 def prefix(identity):
     return "teams/{team_id}/shared/tasks/{task_id}/checkpoints/outputs/".format(**identity)
-
-
-def publish(identity, workspace, path, operation):
-    path = (workspace / path).resolve()
-    name = path.relative_to(workspace.resolve()).as_posix()
-    sha = digest(path)
-    key = prefix(identity) + operation.removeprefix("tools:") + "/" + sha + "/" + name
-    subprocess.run(["mc", "cp", str(path), os.environ["AGENTTEAMS_STORAGE_PREFIX"].rstrip("/") + "/" + key],
-                   check=True, capture_output=True, timeout=60)
-    return {"key": key, "sha256": sha, "size": path.stat().st_size}
 
 
 def restore(identity, checkpoint, workspace):
@@ -62,23 +55,69 @@ def terminal_path(identity, operation):
     return f"{prefix}/agents/{member}/claude-code/receipts/{identity['team_id']}/{identity['task_id']}/{name}.json"
 
 
-def persist_terminal(identity, operation, result, artifacts):
-    record = {"identity": identity, "operation": operation, "result": result, "artifacts": artifacts}
+def local_receipt(identity, operation):
+    # Reuse the validated operation name and the member's private runtime volume.
+    terminal_path(identity, operation)
+    directory = Path(os.environ["TEAMHARNESS_RUNTIME_CONFIG"]).parent / "claude-receipts"
+    key = hashlib.sha256(json.dumps([identity["team_id"], identity["task_id"], operation]).encode()).hexdigest()
+    return directory / key / "terminal.json"
+
+
+def stage_output(identity, workspace, path, operation):
+    path = (workspace / path).resolve()
+    name = path.relative_to(workspace.resolve()).as_posix()
+    sha = digest(path)
+    artifact = {"key": prefix(identity) + operation.removeprefix("tools:") + "/" + sha + "/" + name,
+                "sha256": sha, "size": path.stat().st_size}
+    copy = local_receipt(identity, operation).parent / sha
+    copy.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    shutil.copyfile(path, copy)
+    with copy.open("rb") as stream:
+        os.fsync(stream.fileno())
+    if copy.stat().st_size != artifact["size"] or digest(copy) != sha:
+        raise RecoveryConflict("Native output changed while its receipt was staged")
+    return artifact, {"path": str(copy), "artifact": artifact}
+
+
+def flush_terminal(record):
+    for output in record.get("files", []):
+        path, artifact = Path(output["path"]), output["artifact"]
+        if path.stat().st_size != artifact["size"] or digest(path) != artifact["sha256"]:
+            raise RecoveryConflict("Staged native output differs from its terminal receipt")
+        subprocess.run(["mc", "cp", str(path), os.environ["AGENTTEAMS_STORAGE_PREFIX"].rstrip("/") + "/" + artifact["key"]],
+                       check=True, capture_output=True, timeout=60)
+    identity, operation = record["identity"], record["operation"]
     subprocess.run(["mc", "pipe", terminal_path(identity, operation)], input=json.dumps(record).encode(),
                    check=True, capture_output=True, timeout=30)
 
 
+def persist_terminal(identity, operation, result, artifacts, *, files=()):
+    record = {"identity": identity, "operation": operation, "result": result, "artifacts": artifacts, "files": list(files)}
+    path = local_receipt(identity, operation)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    atomic_write(path, json.dumps(record))
+    # The terminal receipt and immutable bytes survive an upload failure. A
+    # replacement retries storage, never the original native file mutation.
+    flush_terminal(record)
+
+
 def load_terminal(identity, operation, expected_call):
     key = terminal_path(identity, operation)
-    parent, name = key.rsplit("/", 1)
-    rows = subprocess.run(["mc", "ls", "--json", parent + "/"], check=True, capture_output=True, timeout=30)
-    if not any(json.loads(line).get("key") == name for line in rows.stdout.splitlines()):
-        return None
-    data = subprocess.run(["mc", "cat", key], check=True, capture_output=True, timeout=30)
-    record = json.loads(data.stdout)
+    local = local_receipt(identity, operation)
+    if local.is_file():
+        record = json.loads(local.read_text())
+    else:
+        parent, name = key.rsplit("/", 1)
+        rows = subprocess.run(["mc", "ls", "--json", parent + "/"], check=True, capture_output=True, timeout=30)
+        if not any(json.loads(line).get("key") == name for line in rows.stdout.splitlines()):
+            return None
+        data = subprocess.run(["mc", "cat", key], check=True, capture_output=True, timeout=30)
+        record = json.loads(data.stdout)
     original = record.get("identity") or {}
     if (record.get("operation") != operation or (record.get("result") or {}).get("id") != expected_call
             or any(original.get(k) != identity[k] for k in ("task_id", "team_id"))
             or not 0 < original.get("generation", 0) <= identity["generation"]):
         raise RecoveryConflict("Stored native receipt does not match the claimed task operation")
+    if local.is_file():
+        flush_terminal(record)
     return record

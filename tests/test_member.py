@@ -43,6 +43,8 @@ class Wire(BaseHTTPRequestHandler):
                 "!dm:at": {"timeline": {"events": self.server.batch}}}}})
         elif self.path.endswith("joined_rooms"):
             self.reply({"joined_rooms": ["!dm:at"]})
+        elif self.path.endswith("joined_members"):
+            self.reply({"joined": {"@cc:at": {}, "@human:at": {}}})
         elif "/state/m.room.encryption" in self.path:
             self.reply({"errcode": "M_NOT_FOUND"}, 404)
         else:
@@ -52,7 +54,7 @@ class Wire(BaseHTTPRequestHandler):
         content = json.load(self.rfile_body())
         self.server.puts.append(self.path)
         self.server.sent[self.path] = content
-        if self.server.lose_ack:
+        if self.server.lose_ack and content.get("body") == "first-ok":
             self.server.lose_ack = False
             self.reply({"errcode": "M_UNAVAILABLE"}, 503)
             return
@@ -77,10 +79,11 @@ class Wire(BaseHTTPRequestHandler):
         usage = {"input_tokens": 5, "output_tokens": 3}
         start = {"id": "msg_fixture_" + str(len(self.server.requests)), "type": "message", "role": "assistant",
                  "model": model, "content": [], "stop_reason": None, "usage": usage}
-        tool_name = "mcp__teamharness__health"
+        tool_name = getattr(self.server, "tool_name", "mcp__teamharness__health")
+        tool_input = getattr(self.server, "tool_input", {})
         block = {"type": "tool_use", "id": "toolu_local", "name": tool_name, "input": {}} if first else {
             "type": "text", "text": ""}
-        delta = {"type": "input_json_delta", "partial_json": "{}"} if first else {
+        delta = {"type": "input_json_delta", "partial_json": json.dumps(tool_input)} if first else {
             "type": "text_delta", "text": "second-ok" if resume else "first-ok"}
         frames = [
             ("message_start", {"message": start}),
@@ -91,6 +94,16 @@ class Wire(BaseHTTPRequestHandler):
                                "usage": usage}),
             ("message_stop", {}),
         ]
+        if first and getattr(self.server, "thinking", None):
+            for _, value in frames:
+                if "index" in value:
+                    value["index"] += 1
+            frames[1:1] = [
+                ("content_block_start", {"index": 0, "content_block": {"type": "thinking", "thinking": "", "signature": ""}}),
+                ("content_block_delta", {"index": 0, "delta": {"type": "thinking_delta", "thinking": self.server.thinking}}),
+                ("content_block_delta", {"index": 0, "delta": {"type": "signature_delta", "signature": "fixture-signature"}}),
+                ("content_block_stop", {"index": 0}),
+            ]
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
@@ -185,8 +198,11 @@ class MemberTest(unittest.TestCase):
                 calls = len(http.requests)
                 poll(MemberState(runtime), True)
                 self.assertEqual(len(http.requests), calls)
-                self.assertEqual(http.puts, [http.puts[0], http.puts[0]])
-                self.assertEqual([out["body"] for out in http.sent.values()], ["first-ok"])
+                replies = [out for out in http.sent.values() if not out.get("org.agentteams.progress_only")]
+                final_puts = [path for path in http.puts if http.sent[path].get("body") == "first-ok"]
+                self.assertEqual(len(final_puts), 2)
+                self.assertEqual(final_puts[0], final_puts[1])
+                self.assertEqual([out["body"] for out in replies], ["first-ok"])
                 results = [b for m in http.requests[-1]["messages"] if isinstance(m["content"], list)
                            for b in m["content"] if b.get("type") == "tool_result"]
                 self.assertEqual(len(results), 1)
@@ -195,7 +211,7 @@ class MemberTest(unittest.TestCase):
                 http.cursor, http.batch = "c2", [http.batch[1], message("second-turn", "$two")]
                 previous_count = len(http.requests)
                 poll(MemberState(runtime), True)
-                replies = list(http.sent.values())
+                replies = [out for out in http.sent.values() if not out.get("org.agentteams.progress_only")]
                 self.assertEqual([out["body"] for out in replies], ["first-ok", "second-ok"])
                 self.assertEqual(len(http.requests), previous_count + 1)
                 self.assertIn("first-turn", json.dumps(http.requests[-1]["messages"]))

@@ -19,6 +19,7 @@ from runtime_observability import event as trace
 
 from turn import run_turn
 from worker_files import load_terminal, restore
+from interaction import MatrixTurn, TurnStopped
 
 
 def native(request):
@@ -208,8 +209,22 @@ def recover_work(state, client, record, provider, assignments):
             sessions.remember(work, view, saved_execution, native_ref, hashlib.sha256(data).hexdigest(), int(time.time()) + 86400)
             return True
 
-        ref, answer = asyncio.run(run_turn(record, provider, directory, prompt, session, context,
-                                           Path(os.environ["AGENTTEAMS_PLUGIN_DIR"]), on_checkpoint=remember_checkpoint))
+        admin = ((record.get("team") or {}).get("admin") or {}).get("matrixUserId")
+        event = {"event_id": source_id or f"task:{task_id}:{execution['generation']}", "room_id": task["room_id"],
+                 "sender": source.get("sender") or admin or record["member"]["matrixUserId"],
+                 "coordination_session": task_id}
+        interaction = MatrixTurn(client, record, event, state.data, state.save)
+        def current():
+            saved = recovery.current(task_id, team)
+            actual = saved.get("execution") or {} if saved else {}
+            return bool(saved and saved["status"] != "cancelled" and actual.get("state") == "active"
+                        and all(actual.get(k) == identity[k] for k in ("generation", "instance_id", "process_id")))
+        interaction.current = current
+        try:
+            ref, answer = asyncio.run(run_turn(record, provider, directory, prompt, session, context,
+                Path(os.environ["AGENTTEAMS_PLUGIN_DIR"]), on_checkpoint=remember_checkpoint, interaction=interaction))
+        except TurnStopped:
+            continue  # Cancellation is authoritative; never submit a synthetic completion.
         saved = recovery.current(task_id, team)
         if not saved or saved["status"] in {"completed", "cancelled"}:
             continue

@@ -25,6 +25,7 @@ from turn import role_of, run_turn
 from task_worker import native, recover_work
 from worker_handoff import recovery_scanned
 from worker_sync import scan, deliver_message
+from interaction import MatrixTurn, TurnStopped
 
 
 def mc(*args):
@@ -146,36 +147,23 @@ def admitted(raw, room, rooms, member, agents, transport, deny):
             return None
         parsed = managed_matrix_event({"room_id": room, "event_id": event_id, "input": raw},
                                       rooms, own, agents, transport)
-        if not parsed or parsed[0] == "control":
+        if not parsed:
             return None
         event = parsed[2]
+        if parsed[0] == "control" or event.get("body", "").split(" ", 1)[0] in {"/approve", "/reject", "/answer", "/cancel", "/steer"}:
+            event["control"] = True
     return {**event, "event_id": event_id, "room_id": room, "sender": sender,
             "carrier": content.get("com.agentteams.trace") or {}}
 
 
 def manager_inputs(events):
-    group = []
-
-    def combined():
-        if len(group) == 1:
-            return group[0]
-        frames = [{"event_id": e["event_id"], "room_id": e["room_id"], "sender_id": e["sender"], "body": e["body"]}
-                  for e in group]
-        body = "\n\n".join(f"[Message {f['event_id']}]\n{f['body']}" for f in frames)
-        return dict(group[0], body=body, frames=frames)
-
+    seen = set()
     for event in events:
-        plain = not event.get("coordination_session") and event.get("kind", "text") == "text"
-        if group and (not plain or event["sender"] != group[0]["sender"]):
-            yield combined()
-            group.clear()
-        if plain:
-            if not any(previous["event_id"] == event["event_id"] for previous in group):
-                group.append(event)
-        else:
+        # An inference result acknowledges only its actual source event. Equal
+        # text is not evidence that independent Human requests are duplicates.
+        if event["event_id"] not in seen:
+            seen.add(event["event_id"])
             yield event
-    if group:
-        yield combined()
 
 
 def execute(state, client, record, provider, event, agents, *, matrix=None, claim=None):
@@ -239,7 +227,17 @@ def execute_input(state, client, record, provider, event, agents, matrix, claim)
 
         try:
             session, answer = asyncio.run(run_turn(record, provider, workspace, prompt,
-                state.data["sessions"].get(scope), task, Path(os.environ["AGENTTEAMS_PLUGIN_DIR"]), on_effect=before_effect))
+                state.data["sessions"].get(scope), task, Path(os.environ["AGENTTEAMS_PLUGIN_DIR"]), on_effect=before_effect,
+                interaction=MatrixTurn(client, record, event, state.data, state.save)))
+        except TurnStopped as stopped:
+            if claim:
+                matrix.message_cancel(claim["identity"])
+            slot.update(stage="stopped", delivered=True)
+            if stopped.session:
+                state.data["sessions"][scope] = stopped.session
+            state.snapshot()
+            state.save()
+            return
         except Exception:
             if phase:
                 slot["stage"] = "retry_phase"
@@ -310,6 +308,10 @@ def poll(state, ready):
     agents = {m["matrixUserId"] for m in team.get("members") or []
               if m.get("role") != "human" and m.get("matrixUserId")}
     client = MatrixClient(transport["homeserver"], transport["accessToken"])
+    if not ready and (state.data.get("interaction_pending") or state.data.get("interaction_receipts")):
+        pending = next(iter(state.data.get("interaction_pending", {}).values()), {})
+        event = {"event_id": pending.get("run_id", "restart"), "room_id": pending.get("room_id", ""), "sender": member["matrixUserId"]}
+        asyncio.run(MatrixTurn(client, record, event, state.data, state.save).retire_previous())
     worker = role_of(record) in {"worker", "remote-member"} and bool(os.getenv("AGENTTEAMS_CONTROLLER_URL"))
     if worker:
         matrix, pending, assignments = scan(client, record, transport, rooms, agents, ready, admitted)
@@ -342,7 +344,7 @@ def poll(state, ready):
             if state.data["events"].get(raw.get("event_id"), {}).get("delivered"):
                 continue
             event = admitted(raw, room, rooms, member, agents, transport, record["desired"].get("channelPolicy") or {})
-            if event:
+            if event and not event.get("control"):
                 inputs.append(event)
         for event in manager_inputs(inputs) if role_of(record) == "manager" else inputs:
             execute(state, client, record, provider, event, agents)

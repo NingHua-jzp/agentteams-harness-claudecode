@@ -15,6 +15,11 @@ import turn
 
 
 class WorkerRegression(unittest.TestCase):
+    def test_equal_text_is_not_a_duplicate_input(self):
+        events = [{"event_id": eid, "sender": "@human:test", "room_id": "!room:test", "body": "Create a report"}
+                  for eid in ("$one", "$two", "$two")]
+        self.assertEqual([e["event_id"] for e in bridge.manager_inputs(events)], ["$one", "$two"])
+
     def test_preparation_timeout_redelivery_uses_same_event(self):
         state, client = Mock(), Mock()
         state.data = {"events": {}, "sessions": {}}
@@ -163,6 +168,26 @@ class NativeRecovery(unittest.TestCase):
         self.run_scan()
         self.completed.assert_called_once()
         self.go.assert_not_called()
+
+    def test_handoff_from_another_harness_uses_checkpoint_not_foreign_cache(self):
+        from worker_sessions import WorkerSessions
+        import time
+        with tempfile.TemporaryDirectory() as directory:
+            self.state.projects = Path(directory) / "projects"
+            self.state.projects.mkdir()
+            view = self.sessions.load.return_value
+            view.update(runtime="claudecode", compatible=True, checkpoint_version=3, config_generation=1,
+                        cache={"runtime": "qwenpaw", "native_ref": "qwen-session", "native_digest": "foreign",
+                               "checkpoint_version": 3, "checkpoint_digest": view["checkpoint_digest"],
+                               "config_generation": 1, "expires_at": int(time.time()) + 300})
+            self.sessions.usable.side_effect = WorkerSessions("claudecode", recovery=self.recovery).usable
+            self.recovery.resume_text.return_value = "authoritative saved checkpoint"
+            self.rpc.side_effect = [{"ok": True}, {"execution": "child", "context": {"outputDirectory": directory}, "fact": "prepared"}]
+            self.recovery.current.return_value = None
+            with patch.dict(os.environ, AGENTTEAMS_PLUGIN_DIR=directory), patch("task_worker.require_unencrypted_room"):
+                self.run_scan()
+            self.assertIsNone(self.go.await_args.args[4])
+            self.assertIn("authoritative saved checkpoint", self.go.await_args.args[3])
 
 class InterruptedRead(unittest.TestCase):
     def test_only_matching_native_terminal_result_reconciles(self):
